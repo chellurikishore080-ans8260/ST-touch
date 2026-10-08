@@ -33,11 +33,6 @@ st.set_page_config(page_title="Supertrend Wick-Touch Scanner", page_icon="🎯",
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# ----------------------------------------------------------------------------------
-# Constants
-# ----------------------------------------------------------------------------------
-# data-api.binance.vision is Binance's public market-data mirror; it is not geo-blocked
-# for US-hosted servers (e.g. Streamlit Community Cloud) the way api.binance.com is.
 SPOT_HOSTS = [
     "https://data-api.binance.vision",
     "https://api.binance.com",
@@ -56,24 +51,16 @@ TIER_LABEL = {
     TIER_REPEAT: "⚪ REPEAT",
 }
 
-
-# ----------------------------------------------------------------------------------
-# Binance REST helpers
-# ----------------------------------------------------------------------------------
 class BinanceError(Exception):
     pass
-
 
 class GeoBlocked(BinanceError):
     pass
 
-
 class RateLimited(BinanceError):
     pass
 
-
 _tls = threading.local()
-
 
 def _session():
     s = getattr(_tls, "s", None)
@@ -82,7 +69,6 @@ def _session():
         s.headers.update({"User-Agent": "supertrend-wick-scanner/1.0"})
         _tls.s = s
     return s
-
 
 def _get(market, path, params=None):
     hosts = SPOT_HOSTS if market == "Spot" else FUT_HOSTS
@@ -104,10 +90,8 @@ def _get(market, path, params=None):
         err = BinanceError(f"HTTP {r.status_code}: {r.text[:100]}")
     raise err or BinanceError("no host reachable")
 
-
 @st.cache_data(ttl=120, show_spinner=False)
 def load_tickers(market):
-    """{symbol: (24h quote volume in USDT, 24h change %)} for every USDT pair."""
     data = _get(market, "/ticker/24hr")
     out = {}
     for t in data:
@@ -122,7 +106,6 @@ def load_tickers(market):
         except (KeyError, ValueError):
             continue
     return out
-
 
 def build_universe(market, top_n, min_vol_m, custom_text):
     tickers = load_tickers(market)
@@ -141,25 +124,19 @@ def build_universe(market, top_n, min_vol_m, custom_text):
     rows.sort(key=lambda x: -x[1])
     return rows[:top_n]
 
-
 def fetch_klines(market, symbol, tf, limit=300):
     raw = _get(market, "/klines", {"symbol": symbol, "interval": tf, "limit": limit})
     if not raw:
         return np.empty((0, 5)), False
     now_ms = time.time() * 1000
     forming = float(raw[-1][6]) > now_ms
-    arr = np.array([[r[0], r[1], r[2], r[3], r[4]] for r in raw], dtype=float)  # t,o,h,l,c
+    arr = np.array([[r[0], r[1], r[2], r[3], r[4]] for r in raw], dtype=float)
     return arr, forming
 
-
-# ----------------------------------------------------------------------------------
-# Supertrend + wick-touch logic (same maths as TradingView's ta.supertrend:
-# Wilder/RMA ATR, ratcheting bands)
-# ----------------------------------------------------------------------------------
 def supertrend(h, l, c, period, mult):
     n = len(c)
     st = np.full(n, np.nan)
-    trend = np.zeros(n, dtype=int)  # +1 bullish (green line), -1 bearish (red line), 0 = warm-up
+    trend = np.zeros(n, dtype=int)
     if n <= period + 1:
         return st, trend
 
@@ -193,4 +170,353 @@ def supertrend(h, l, c, period, mult):
         trend[i] = direction
         st[i] = fl if direction == 1 else fu
     return st, trend
-# ---- end of part 1 ----
+
+def find_touches(h, l, st, trend, tol_pct, gap_candles):
+    tol = tol_pct / 100.0
+    out = []
+    last = -1
+    for i in range(1, len(st)):
+        if trend[i] == 0 or trend[i - 1] == 0:
+            continue
+        if trend[i] != trend[i - 1]:
+            last = -1
+            continue
+        if trend[i] == 1:
+            hit = l[i] <= st[i] * (1 + tol)
+        else:
+            hit = h[i] >= st[i] * (1 - tol)
+        if not hit:
+            continue
+        if last < 0:
+            tier, gap = TIER_FIRST, None
+        else:
+            between = i - last - 1
+            tier = TIER_RETOUCH if between >= gap_candles else TIER_REPEAT
+            gap = between
+        out.append((i, int(trend[i]), tier, gap))
+        last = i
+    return out
+
+def scan_one(market, symbol, tf, qv, P):
+    arr, forming = fetch_klines(market, symbol, tf)
+    if len(arr) == 0:
+        return []
+    if forming and not P["include_forming"]:
+        arr = arr[:-1]
+        forming = False
+    t, _o, h, l, c = arr.T
+    st, trend = supertrend(h, l, c, P["period"], P["mult"])
+    touches = find_touches(h, l, st, trend, P["tol"], P["gaps"][tf])
+    n = len(c)
+    keep = max(P["lookback"], 2)
+    rows = []
+    for i, side, tier, gap in touches:
+        age = n - 1 - i
+        if age >= keep:
+            continue
+        rows.append(
+            dict(
+                symbol=symbol,
+                tf=tf,
+                side=side,
+                tier=tier,
+                gap=gap,
+                age=age,
+                live=bool(forming and i == n - 1),
+                touch_ms=int(t[i]),
+                price=float(c[-1]),
+                st_line=float(st[-1]),
+                dist=(float(c[-1]) - float(st[-1])) / float(st[-1]) * 100.0,
+                qv=qv,
+            )
+        )
+    return rows
+
+def scan_all(market, universe, tfs, P):
+    jobs = [(s, tf, qv) for s, qv in universe for tf in tfs]
+    rows, errors = [], {}
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        futs = {ex.submit(scan_one, market, s, tf, qv, P): (s, tf) for s, tf, qv in jobs}
+        for f in as_completed(futs):
+            try:
+                rows.extend(f.result())
+            except BinanceError as e:
+                errors[str(e)] = errors.get(str(e), 0) + 1
+            except Exception as e:
+                k = f"{type(e).__name__}: {e}"
+                errors[k] = errors.get(k, 0) + 1
+    return rows, errors, len(jobs)
+BEEP_HTML = """
+<script>
+(function(){try{
+  var C=window.AudioContext||window.webkitAudioContext; var a=new C();
+  [880,1175,1568].forEach(function(f,k){
+    var o=a.createOscillator(), g=a.createGain(); o.frequency.value=f; o.connect(g); g.connect(a.destination);
+    var t=a.currentTime+k*0.18;
+    g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(0.4,t+0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+0.16); o.start(t); o.stop(t+0.17);
+  });
+}catch(e){}})();
+</script>
+"""
+
+def play_beep():
+    try:
+        if hasattr(st, "iframe"):
+            st.iframe(BEEP_HTML, width=1, height=1)
+        else:
+            components.html(BEEP_HTML, height=0)
+    except Exception:
+        pass
+
+def _secret(name):
+    try:
+        v = st.secrets.get(name)
+    except Exception:
+        v = None
+    return v or os.environ.get(name)
+
+def telegram_configured():
+    return bool(_secret("TELEGRAM_BOT_TOKEN") and _secret("TELEGRAM_CHAT_ID"))
+
+def send_telegram(text):
+    tok, cid = _secret("TELEGRAM_BOT_TOKEN"), _secret("TELEGRAM_CHAT_ID")
+    if not (tok and cid):
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{tok}/sendMessage",
+            data={"chat_id": cid, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=8,
+        )
+        return r.status_code == 200
+    except requests.RequestException:
+        return False
+
+def fmt_price(x):
+    return f"{x:.6g}"
+
+def alert_line(r):
+    arrow = "⬆️ UPSIDE" if r["side"] == 1 else "⬇️ DOWNSIDE"
+    when = "LIVE" if r["live"] else "just closed"
+    return (
+        f"{TIER_LABEL[r['tier']]} | {r['symbol']} {r['tf']} | {arrow} | "
+        f"price {fmt_price(r['price'])} / line {fmt_price(r['st_line'])} | {when}"
+    )
+
+if not hasattr(st, "fragment"):
+    st.error("This page needs streamlit>=1.37 (for live auto-refresh). Update requirements.txt: `streamlit>=1.37`.")
+    st.stop()
+
+with st.sidebar:
+    st.header("⚙️ Settings")
+    market_choice = st.radio("Market", ["Spot", "Futures (USDT-M)"], horizontal=True)
+    market = "Futures" if market_choice.startswith("Futures") else "Spot"
+
+    tfs = st.multiselect("Timeframes", list(TF_MINUTES), default=["15m", "1h", "4h"])
+    st.caption("Gap candles: after a touch, this many candles must form before the next touch counts as fresh again.")
+    gaps = {}
+    for tf in tfs:
+        gaps[tf] = int(st.number_input(f"{tf} — gap candles", 0, 100, 5, 1, key=f"gap_{tf}"))
+
+    c1, c2 = st.columns(2)
+    period = int(c1.number_input("ATR period", 2, 100, 10, 1))
+    mult = float(c2.number_input("Multiplier", 0.5, 10.0, 3.0, 0.1))
+    tol = float(st.number_input("Wick tolerance % (0 = wick must really touch the line)", 0.0, 2.0, 0.0, 0.01))
+    include_forming = st.checkbox("Include live (forming) candle → instant alerts", True)
+    lookback = st.slider("Show touches from last N candles", 1, 10, 3)
+    side_filter = st.radio("Direction", ["Both", "Upside only", "Downside only"], horizontal=True)
+    show_repeat = st.checkbox("Also show REPEAT touches (inside the gap)", False)
+
+    st.divider()
+    top_n = st.slider("Coins (top by 24h volume)", 10, 300, 100, 10)
+    min_vol = float(st.number_input("Min 24h volume (M USDT)", 0.0, 1000.0, 5.0, 1.0))
+    custom = st.text_area("Custom coins (optional — overrides the above)", placeholder="BTC, ETH, SOL, PEPE")
+
+    st.divider()
+    auto = st.checkbox("Auto refresh", True)
+    refresh = st.slider("Refresh every (sec)", 15, 300, 60, 5)
+    sound = st.checkbox("🔊 Beep on new alert", True)
+    tg_ok = telegram_configured()
+    use_tg = st.checkbox("📨 Telegram alert", value=tg_ok, disabled=not tg_ok)
+    if not tg_ok:
+        st.caption(
+            "Telegram off: add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Streamlit secrets "
+            "to also get alerts on your phone (the app must be running on the server)."
+        )
+    st.button("🔄 Scan now")
+
+st.title("🎯 Supertrend Wick-Touch Scanner")
+st.caption(
+    f"Binance {market_choice} · Supertrend({period},{mult:g}) · "
+    "⬆️ low wick touches GREEN line = upside · ⬇️ high wick touches RED line = downside"
+)
+
+if not tfs:
+    st.warning("Select at least one timeframe in the sidebar.")
+    st.stop()
+
+PARAMS = dict(
+    period=period,
+    mult=mult,
+    tol=tol,
+    include_forming=include_forming,
+    lookback=lookback,
+    gaps=gaps,
+)
+
+@st.fragment(run_every=(f"{refresh}s" if auto else None))
+def live_scanner():
+    t0 = time.time()
+    try:
+        universe = build_universe(market, top_n, min_vol, custom)
+    except BinanceError as e:
+        if isinstance(e, GeoBlocked):
+            st.error(
+                "Binance is blocking this server's location (HTTP 451/403). Streamlit Community Cloud runs in the US, "
+                "which Binance blocks. Host the app in another region (Render Singapore, a VPS, Railway EU…) or run it locally."
+            )
+        else:
+            st.error(f"Could not load the coin list: {e}")
+        return
+    if not universe:
+        st.warning("No coins matched (check min volume / custom list).")
+        return
+
+    n_req = len(universe) * len(tfs)
+    if n_req > 800:
+        st.warning(f"{n_req} requests per scan is heavy — Binance may rate-limit you. Reduce coins or timeframes.")
+
+    rows, errors, n_pairs = scan_all(market, universe, tfs, PARAMS)
+    elapsed = time.time() - t0
+
+    if errors and len(errors) and sum(errors.values()) >= n_pairs:
+        first = next(iter(errors))
+        if "451" in first or "403" in first:
+            st.error("Binance blocks this server's location (HTTP 451/403). Host the app outside the US, or run locally.")
+        else:
+            st.error(f"Every request failed: {first}")
+        return
+    if errors:
+        st.caption("⚠️ Some requests failed: " + " · ".join(f"{k} ×{v}" for k, v in errors.items()))
+
+    if side_filter == "Upside only":
+        rows = [r for r in rows if r["side"] == 1]
+    elif side_filter == "Downside only":
+        rows = [r for r in rows if r["side"] == -1]
+
+    seen = st.session_state.setdefault("seen_alerts", set())
+    candidates = [r for r in rows if r["tier"] != TIER_REPEAT and r["age"] <= 1]
+    keyed = [((r["symbol"], r["tf"], r["touch_ms"], r["side"]), r) for r in candidates]
+    new = [r for k, r in keyed if k not in seen]
+    first_run = not st.session_state.get("baselined", False)
+    for k, _ in keyed:
+        seen.add(k)
+    st.session_state["baselined"] = True
+
+    if new and not first_run:
+        new.sort(key=lambda r: (r["tier"], r["age"], -TF_MINUTES[r["tf"]]))
+        for r in new[:6]:
+            st.toast(alert_line(r), icon="🎯")
+        if len(new) > 6:
+            st.toast(f"+{len(new) - 6} more fresh touches", icon="🎯")
+        if sound:
+            play_beep()
+        if use_tg:
+            body = "\n".join(alert_line(r) for r in new[:15])
+            send_telegram(f"🎯 <b>Supertrend wick touch</b>\n{body}")
+    elif first_run:
+        st.caption("First scan done — only NEW touches from now on will trigger alerts.")
+
+    shown = [r for r in rows if r["age"] < lookback and (show_repeat or r["tier"] != TIER_REPEAT)]
+    shown.sort(key=lambda r: (r["tier"], r["age"], -TF_MINUTES[r["tf"]], -r["qv"]))
+
+    n_first = sum(1 for r in shown if r["tier"] == TIER_FIRST)
+    n_re = sum(1 for r in shown if r["tier"] == TIER_RETOUCH)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Coins scanned", len(universe))
+    m2.metric("🟢 FIRST touches", n_first)
+    m3.metric("🟡 RE-TOUCHES", n_re)
+    m4.metric("Last scan (IST)", datetime.now(IST).strftime("%H:%M:%S"), f"{elapsed:.1f}s")
+
+    if not shown:
+        st.info("No fresh wick touch right now. Waiting for the next scan…")
+        return
+
+    recs = []
+    for r in shown:
+        base = r["symbol"][:-4]
+        if market == "Spot":
+            link = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
+        else:
+            link = f"https://www.binance.com/en/futures/{r['symbol']}"
+        if r["live"]:
+            when = "🔴 LIVE"
+        elif r["age"] == 0:
+            when = "latest closed"
+        else:
+            when = f"{r['age']} candle{'s' if r['age'] > 1 else ''} ago"
+        recs.append(
+            {
+                "Priority": TIER_LABEL[r["tier"]],
+                "Coin": r["symbol"],
+                "TF": r["tf"],
+                "Signal": "⬆️ UPSIDE" if r["side"] == 1 else "⬇️ DOWNSIDE",
+                "Touch candle": when,
+                "Candles since prev touch": "— (first)" if r["gap"] is None else str(r["gap"]),
+                "Price": r["price"],
+                "ST line": r["st_line"],
+                "Price vs line %": round(r["dist"], 2),
+                "24h vol (M)": round(r["qv"] / 1e6, 1),
+                "Touch time (IST)": datetime.fromtimestamp(r["touch_ms"] / 1000, IST).strftime("%d %b %H:%M"),
+                "Chart": link,
+            }
+        )
+    df = pd.DataFrame(recs)
+
+    def row_style(row):
+        if row["Priority"].startswith("🟢"):
+            bg = "background-color: rgba(46,189,133,0.18)"
+        elif row["Priority"].startswith("🟡"):
+            bg = "background-color: rgba(240,185,11,0.16)"
+        else:
+            bg = ""
+        return [bg] * len(row)
+
+    table_kwargs = dict(
+        hide_index=True,
+        column_config={
+            "Price": st.column_config.NumberColumn(format="%.6g"),
+            "ST line": st.column_config.NumberColumn(format="%.6g"),
+            "Price vs line %": st.column_config.NumberColumn(format="%.2f%%"),
+            "24h vol (M)": st.column_config.NumberColumn(format="%.1f"),
+            "Chart": st.column_config.LinkColumn(display_text="open"),
+        },
+    )
+    styled = df.style.apply(row_style, axis=1)
+    try:
+        st.dataframe(styled, width="stretch", **table_kwargs)
+    except TypeError:
+        st.dataframe(styled, use_container_width=True, **table_kwargs)
+    st.caption(
+        "🔴 LIVE = wick touched on the still-forming candle (can still flip if the candle closes through the line). "
+        "FIRST = first touch since the Supertrend trend began. "
+        f"RE-TOUCH = touched again after at least the gap candles you set per timeframe ({', '.join(f'{k}: {v}' for k, v in gaps.items())})."
+    )
+
+live_scanner()
+
+with st.expander("ℹ️ How the logic works"):
+    st.markdown(
+        """
+- **Touch** — bullish trend: candle *low* ≤ green line. Bearish trend: candle *high* ≥ red line.
+  A candle that *closes* through the line flips the trend; that is a break, so it is not counted.
+- **Run** — a run starts when the trend flips. Touches are only compared inside the same run.
+- **FIRST** — no earlier touch in this run → top of the table.
+- **RE-TOUCH** — an earlier touch exists, but at least *gap candles* (sidebar, per timeframe) have formed since → still fresh.
+- **REPEAT** — touched again inside the gap → hidden unless you tick *Also show REPEAT*.
+- **Alerts** fire once per candle per coin/timeframe for FIRST and RE-TOUCH only, the moment the touch is seen
+  (live candle) — toast + beep, plus Telegram if configured.
+- Data: Binance public market data only (no API key). Sorting: priority → most recent → higher timeframe → volume.
+"""
+    )
