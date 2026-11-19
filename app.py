@@ -506,6 +506,10 @@ def live_scanner():
 
 live_scanner()
 
+# ---- ST Short-Only Box (separate box: short trades, live PnL, RR 1-10 backtest) ----
+from short_st_box import render_short_box
+render_short_box()
+
 with st.expander("ℹ️ How the logic works"):
     st.markdown(
         """
